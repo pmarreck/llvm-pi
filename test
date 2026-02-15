@@ -44,12 +44,37 @@ run_test() {
 	fi
 }
 
+# Hardcoded pi prefix — independent of pi_reference.txt
+# Source: first 50 decimals of pi are universally agreed upon
+KNOWN_PI="3.14159265358979323846264338327950288419716939937510"
+
+# Verify pi_reference.txt itself starts with known pi digits
+if [[ "${PI_REF:0:52}" != "$KNOWN_PI" ]]; then
+	echo "FATAL: pi_reference.txt does not start with known pi digits!"
+	echo "  expected: $KNOWN_PI"
+	echo "  got:      ${PI_REF:0:52}"
+	exit 1
+fi
+
 # Build first
 echo "=== Building ==="
 nix develop -c bash -c './build' || { echo "Build failed"; exit 1; }
 echo
 
 echo "=== Running tests ==="
+
+# First: verify output starts with hardcoded known pi (catches pi/2 bugs etc.)
+actual_check="$(nix develop -c ./pi 50 2>&1 | tr -d '\n')"
+if [[ "$actual_check" != "$KNOWN_PI" ]]; then
+	echo "FAIL [hardcoded-pi]: output does not match known pi digits"
+	echo "  expected: $KNOWN_PI"
+	echo "  got:      $actual_check"
+	FAIL=$((FAIL + 1))
+else
+	echo "PASS [hardcoded-pi]: output starts with known pi"
+	PASS=$((PASS + 1))
+fi
+
 run_test 50 "sanity-50"
 run_test 100 "basic-100"
 run_test 1000 "medium-1000"
