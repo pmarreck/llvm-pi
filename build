@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+# Detect CPU for llc
+detect_mcpu() {
+	if [[ "$(uname -m)" == "arm64" || "$(uname -m)" == "aarch64" ]]; then
+		# Try apple-m4, fall back to apple-m1, fall back to generic
+		for cpu in apple-m4 apple-m1 generic; do
+			if nix develop -c llc -mcpu="$cpu" -mtriple=aarch64-apple-darwin /dev/null -o /dev/null 2>/dev/null; then
+				echo "$cpu"
+				return
+			fi
+		done
+		echo "generic"
+	else
+		echo "generic"
+	fi
+}
+
+OPT="${1:--O2}"
+MCPU="$(detect_mcpu)"
+TRIPLE=""
+if [[ "$(uname -m)" == "arm64" || "$(uname -m)" == "aarch64" ]]; then
+	TRIPLE="-mtriple=aarch64-apple-darwin"
+fi
+
+echo "Building with -mcpu=$MCPU $OPT"
+
+# Assemble LLVM IR to object file
+nix develop -c llc "$OPT" -mcpu="$MCPU" $TRIPLE -filetype=obj chudnovsky.ll -o chudnovsky.o
+
+# Compile C
+nix develop -c clang "$OPT" -I"$GMP_INCLUDE" -c main.c -o main.o
+
+# Link
+nix develop -c clang "$OPT" main.o chudnovsky.o -L"$GMP_LIB" -lgmp -o pi
+
+echo "Built: ./pi"
