@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+PASS=0
+FAIL=0
+PI_REF="$(cat pi_reference.txt)"
+
+run_test() {
+	local digits="$1"
+	local label="$2"
+	# Expected: "3." + first $digits decimal digits from reference
+	local expected
+	expected="$(echo "$PI_REF" | head -c $((digits + 2)))"  # "3." = 2 chars
+
+	local actual
+	actual="$(nix develop -c ./pi "$digits" 2>&1)" || {
+		echo "FAIL [$label]: pi $digits crashed"
+		FAIL=$((FAIL + 1))
+		return
+	}
+
+	# Trim trailing whitespace/newlines from actual
+	actual="$(echo -n "$actual" | tr -d '\n')"
+
+	# Compare: actual must match expected exactly
+	if [[ "$actual" == "$expected" ]]; then
+		echo "PASS [$label]: $digits digits match"
+		PASS=$((PASS + 1))
+	else
+		echo "FAIL [$label]: $digits digits mismatch"
+		echo "  expected (first 60): ${expected:0:60}..."
+		echo "  actual   (first 60): ${actual:0:60}..."
+		# Show first divergence point
+		local i
+		for ((i=0; i<${#expected} && i<${#actual}; i++)); do
+			if [[ "${expected:$i:1}" != "${actual:$i:1}" ]]; then
+				echo "  first diff at position $i: expected '${expected:$i:1}' got '${actual:$i:1}'"
+				break
+			fi
+		done
+		FAIL=$((FAIL + 1))
+	fi
+}
+
+# Build first
+echo "=== Building ==="
+nix develop -c bash -c './build' || { echo "Build failed"; exit 1; }
+echo
+
+echo "=== Running tests ==="
+run_test 50 "sanity-50"
+run_test 100 "basic-100"
+run_test 1000 "medium-1000"
+
+echo
+echo "=== Results: $PASS passed, $FAIL failed ==="
+exit "$FAIL"
