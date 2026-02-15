@@ -1,0 +1,14 @@
+# Build artifacts
+*.o
+pi
+result
+
+# Debug/test artifacts
+debug_test*
+minimal_test*
+
+# Nix
+result
+
+# codescan
+.codescan/
