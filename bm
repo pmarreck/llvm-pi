@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+echo "=== Building (optimized) ==="
+nix develop -c bash -c './build -O2'
+
+echo
+echo "=== Benchmarks (CPU time via /usr/bin/time) ==="
+
+for digits in 1000 10000 100000 1000000; do
+	printf "%-15s " "${digits} digits:"
+	# Use /usr/bin/time for CPU time; discard pi output
+	result=$( { /usr/bin/time -p nix develop -c ./pi "$digits" > /dev/null; } 2>&1 )
+	user=$(echo "$result" | grep '^user' | awk '{print $2}')
+	sys=$(echo "$result" | grep '^sys' | awk '{print $2}')
+	total=$(echo "$user + $sys" | bc)
+	echo "${total}s cpu (${user}s user, ${sys}s sys)"
+done
