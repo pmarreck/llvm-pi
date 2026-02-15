@@ -10,5 +10,9 @@ minimal_test*
 # Nix
 result
 
+# Bench binaries (source is tracked, binaries are not)
+bench/gmp-chudnovsky
+bench/mpfr-pi
+
 # codescan
 .codescan/

@@ -18,12 +18,16 @@
             buildInputs = [
               pkgs.gmp
               pkgs.gmp.dev
+              pkgs.mpfr
+              pkgs.mpfr.dev
               pkgs.llvmPackages_19.llvm
               pkgs.clang_19
             ];
             shellHook = ''
               export GMP_INCLUDE="${pkgs.gmp.dev}/include"
               export GMP_LIB="${pkgs.gmp}/lib"
+              export MPFR_INCLUDE="${pkgs.mpfr.dev}/include"
+              export MPFR_LIB="${pkgs.mpfr}/lib"
             '';
           };
         });

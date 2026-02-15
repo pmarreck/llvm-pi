@@ -3,18 +3,56 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-echo "=== Building (optimized) ==="
-nix develop -c bash -c './build -O2'
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+time_run() {
+	local label="$1"; shift
+	# Use bash's built-in SECONDS with nanosecond-precision date for timing
+	local start end elapsed
+	start=$(date +%s%N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1e9))')
+	"$@" > /dev/null 2>&1
+	end=$(date +%s%N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1e9))')
+	# Compute elapsed in milliseconds
+	elapsed=$(( (end - start) / 1000000 ))
+	if [ "$elapsed" -ge 1000 ]; then
+		printf "  %-28s %s.%03ds\n" "$label" "$((elapsed / 1000))" "$((elapsed % 1000))"
+	else
+		printf "  %-28s %dms\n" "$label" "$elapsed"
+	fi
+}
+
+# ── Build all implementations ────────────────────────────────────────────────
+
+echo "=== Building all implementations ==="
+
+echo "  llvm-pi (hand-written LLVM IR + GMP)..."
+./build > /dev/null 2>&1
+
+echo "  gmp-chudnovsky (C + GMP, by Hanhong Xue)..."
+clang -O2 -Wall -o bench/gmp-chudnovsky bench/gmp-chudnovsky.c -lgmp -lm
+
+echo "  mpfr-pi (C + MPFR, AGM algorithm)..."
+clang -O2 -Wall -o bench/mpfr-pi bench/mpfr-pi.c -lmpfr -lgmp
+
+echo "  Done."
+
+# ── Benchmark ────────────────────────────────────────────────────────────────
 
 echo
-echo "=== Benchmarks (CPU time via /usr/bin/time) ==="
+echo "=== Comparative Pi Benchmark ==="
+echo "Hardware: $(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m)"
+echo "Date:     $(date '+%Y-%m-%d %H:%M')"
+echo
+echo "Implementations:"
+echo "  llvm-pi:          Hand-written LLVM IR, binary splitting Chudnovsky, GMP mpz_t"
+echo "  gmp-chudnovsky:   Reference C (Hanhong Xue), binary splitting Chudnovsky, GMP"
+echo "  mpfr-pi:          MPFR mpfr_const_pi(), AGM/Gauss-Legendre algorithm"
+echo
 
-for digits in 1000 10000 100000 1000000; do
-	printf "%-15s " "${digits} digits:"
-	# Use /usr/bin/time for CPU time; discard pi output
-	result=$( { /usr/bin/time -p nix develop -c ./pi "$digits" > /dev/null; } 2>&1 )
-	user=$(echo "$result" | grep '^user' | awk '{print $2}')
-	sys=$(echo "$result" | grep '^sys' | awk '{print $2}')
-	total=$(echo "$user + $sys" | bc)
-	echo "${total}s cpu (${user}s user, ${sys}s sys)"
+for digits in 1000 10000 100000 1000000 10000000; do
+	echo "── ${digits} digits ──"
+	time_run "llvm-pi (LLVM IR)"         ./pi "$digits"
+	time_run "gmp-chudnovsky (C)"        ./bench/gmp-chudnovsky "$digits" 1
+	time_run "mpfr-pi (MPFR AGM)"        ./bench/mpfr-pi "$digits"
+	echo
 done
