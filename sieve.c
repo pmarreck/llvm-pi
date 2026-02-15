@@ -278,3 +278,380 @@ void sieve_helpers_free(void)
 		gcd_initialized = 0;
 	}
 }
+
+/* ── Pre-allocated recursion stacks ─────────────────────────────────────── */
+/* Eliminates malloc/free per recursion level in binary splitting.
+ * The LLVM IR split function indexes into these arrays by level. */
+
+static mpz_t *pstack, *qstack, *tstack, *gstack;
+static fac_s *fpstack, *fgstack;
+static long stack_depth;
+
+/* Compute recursion depth for asymmetric split (ratio 0.5224).
+ * Max depth = ceil(log(terms) / log(1/0.5224)) + safety margin. */
+static long compute_depth(long terms)
+{
+	if (terms <= 1) return 2;
+	/* log(terms) / log(1/0.5224) ≈ log(terms) / 0.6491 */
+	long depth = (long)(log((double)terms) / log(1.0/0.5224)) + 4;
+	return depth;
+}
+
+/* Allocate stacks for binary splitting. Call after sieve_build. */
+void stacks_init(long terms)
+{
+	long i;
+	stack_depth = compute_depth(terms);
+	pstack = (mpz_t *)malloc(sizeof(mpz_t) * stack_depth);
+	qstack = (mpz_t *)malloc(sizeof(mpz_t) * stack_depth);
+	tstack = (mpz_t *)malloc(sizeof(mpz_t) * stack_depth);
+	gstack = (mpz_t *)malloc(sizeof(mpz_t) * stack_depth);
+	fpstack = (fac_s *)malloc(sizeof(fac_s) * stack_depth);
+	fgstack = (fac_s *)malloc(sizeof(fac_s) * stack_depth);
+	for (i = 0; i < stack_depth; i++) {
+		mpz_init(pstack[i]);
+		mpz_init(qstack[i]);
+		mpz_init(tstack[i]);
+		mpz_init(gstack[i]);
+		fac_init(&fpstack[i]);
+		fac_init(&fgstack[i]);
+	}
+}
+
+/* Free stacks. */
+void stacks_free(void)
+{
+	long i;
+	for (i = 0; i < stack_depth; i++) {
+		mpz_clear(pstack[i]);
+		mpz_clear(qstack[i]);
+		mpz_clear(tstack[i]);
+		mpz_clear(gstack[i]);
+		fac_clear(&fpstack[i]);
+		fac_clear(&fgstack[i]);
+	}
+	free(pstack);
+	free(qstack);
+	free(tstack);
+	free(gstack);
+	free(fpstack);
+	free(fgstack);
+}
+
+/* Get result pointers (level 0 = final results after bs runs) */
+mpz_ptr stack_q(long level) { return qstack[level]; }
+mpz_ptr stack_t_val(long level) { return tstack[level]; }
+
+/* ── Binary splitting (iterative via explicit stack) ───────────────────── */
+
+/* Current stack position. Left child reuses top; right child uses top+1. */
+static long top = 0;
+
+/* Convenience macros for current and next stack level */
+#define p1 (pstack[top])
+#define q1 (qstack[top])
+#define t1 (tstack[top])
+#define g1 (gstack[top])
+#define fp1 (fpstack[top])
+#define fg1 (fgstack[top])
+
+#define p2 (pstack[top+1])
+#define q2 (qstack[top+1])
+#define t2 (tstack[top+1])
+#define g2 (gstack[top+1])
+#define fp2 (fpstack[top+1])
+#define fg2 (fgstack[top+1])
+
+/*
+ * base_case_c: compute single Chudnovsky term for index b.
+ *   Stores into pstack[top], qstack[top], tstack[top], gstack[top],
+ *   fpstack[top], fgstack[top].
+ *
+ * Our naming (matches the LLVM IR convention):
+ *   P = (6b-5)(2b-1)(6b-1)  [linear product]
+ *   Q = b^3 * C^3/24        [cubic product]
+ *   T = P * (A + B*b) * (-1)^b  [accumulated sum]
+ *   G = P                   [copy for merge]
+ *
+ * b=0 special case: P=1, Q=1, T=A, G=1
+ */
+static void base_case_c(unsigned long b)
+{
+	unsigned long i;
+
+	if (b == 0) {
+		mpz_set_ui(p1, 1);
+		mpz_set_ui(q1, 1);
+		mpz_set_si(t1, 13591409L);
+		mpz_set_ui(g1, 1);
+		fac_reset(&fp1);
+		fac_reset(&fg1);
+		return;
+	}
+
+	/* P = (6b-5)(2b-1)(6b-1) */
+	mpz_set_ui(g1, 2*b-1);
+	mpz_mul_ui(g1, g1, 6*b-1);
+	mpz_mul_ui(g1, g1, 6*b-5);
+
+	/* Q = b^3 * C^3/24 = b^3 * 10939058860032000 */
+	mpz_set_ui(q1, b);
+	mpz_mul_ui(q1, q1, b);
+	mpz_mul_ui(q1, q1, b);
+	mpz_mul_ui(q1, q1, (640320UL/24)*(640320UL/24));
+	mpz_mul_ui(q1, q1, 640320UL*24);
+
+	/* T = P * (A + B*b) * (-1)^b */
+	mpz_set_ui(t1, b);
+	mpz_mul_ui(t1, t1, 545140134UL);
+	mpz_add_ui(t1, t1, 13591409UL);
+	mpz_mul(t1, t1, g1);
+	if (b % 2)
+		mpz_neg(t1, t1);
+
+	/* P = Q for storage (we don't actually need P after this) */
+	mpz_set(p1, q1);
+
+	/* Factorized form of Q: strip factors of 2 from b, then (b_odd)^3 * (10005)^3 / 3 */
+	i = b;
+	while ((i & 1) == 0) i >>= 1;
+	fac_set_bp(&fp1, i, 3);
+	fac_mul_bp(&fp1, 3*5*23*29, 3);
+	fp1.pow[0]--;
+
+	/* Factorized form of G = (2b-1)(6b-1)(6b-5) */
+	fac_set_bp(&fg1, 2*b-1, 1);
+	fac_mul_bp(&fg1, 6*b-1, 1);
+	fac_mul_bp(&fg1, 6*b-5, 1);
+}
+
+/*
+ * bs: binary splitting over [a, b) with pre-allocated stacks.
+ * Recursive but uses explicit top counter — NOT call-stack dependent
+ * for data storage. Left child reuses top, right child uses top+1.
+ *
+ * gflag: 1 = maintain G (needed by caller's merge), 0 = skip
+ * level: recursion depth (for GCD threshold)
+ *
+ * After return, results are in pstack[top]/qstack[top]/tstack[top]/gstack[top].
+ */
+static void bs(unsigned long a, unsigned long b, int gflag, long level)
+{
+	unsigned long mid;
+
+	if (b - a == 1) {
+		base_case_c(a);
+		return;
+	}
+
+	/* Asymmetric split (tuning parameter from gmp-chudnovsky) */
+	mid = a + (unsigned long)((b - a) * 0.5224);
+	if (mid == a) mid = a + 1;   /* safety: ensure progress */
+	if (mid >= b) mid = b - 1;
+
+	/* Left half: always maintain G (needed for merge) */
+	bs(a, mid, 1, level + 1);
+
+	/* Right half: uses top+1 */
+	top++;
+	bs(mid, b, gflag, level + 1);
+	top--;
+
+	/* GCD removal at depth >= 4 */
+	if (level >= 4) {
+		fac_remove_gcd(q2, &fp2, g1, &fg1);
+	}
+
+	/* Merge:
+	 *   T = T_L * Q_R + G_L * T_R
+	 *   Q = Q_L * Q_R
+	 *   G = G_L * G_R (if gflag)
+	 */
+	mpz_mul(t1, t1, q2);
+	mpz_mul(t2, t2, g1);
+	mpz_add(t1, t1, t2);
+	mpz_mul(q1, q1, q2);
+
+	fac_mul(&fp1, &fp2);
+
+	if (gflag) {
+		mpz_mul(g1, g1, g2);
+		fac_mul(&fg1, &fg2);
+	}
+}
+
+/*
+ * binary_split: entry point called from LLVM IR.
+ * Runs the full binary splitting, results in qstack[0] (Q) and tstack[0] (T).
+ */
+void binary_split(long N)
+{
+	top = 0;
+	bs(0, (unsigned long)N, 0, 0);
+}
+
+/* ── Newton's method sqrt (precision doubling) ─────────────────────────── */
+/* Adapted from gmp-chudnovsky.c by Hanhong Xue.
+ * Computes r = sqrt(x) using Newton iteration on 1/sqrt(x),
+ * doubling precision at each step. Much faster than mpf_sqrt
+ * for large precisions. */
+
+#define DOUBLE_PREC 53
+
+static mpf_t nt1, nt2;
+static int newton_initialized = 0;
+
+static void newton_init(unsigned long prec)
+{
+	mpf_init2(nt1, prec);
+	mpf_init2(nt2, prec);
+	newton_initialized = 1;
+}
+
+static void newton_free(void)
+{
+	if (newton_initialized) {
+		mpf_clear(nt1);
+		mpf_clear(nt2);
+		newton_initialized = 0;
+	}
+}
+
+static void my_sqrt_ui(mpf_t r, unsigned long x)
+{
+	unsigned long prec, bits, prec0;
+
+	prec0 = mpf_get_prec(r);
+
+	if (prec0 <= DOUBLE_PREC) {
+		mpf_set_d(r, sqrt(x));
+		return;
+	}
+
+	bits = 0;
+	for (prec = prec0; prec > DOUBLE_PREC;) {
+		int bit = prec & 1;
+		prec = (prec + bit) / 2;
+		bits = bits * 2 + bit;
+	}
+
+	mpf_set_prec_raw(nt1, DOUBLE_PREC);
+	mpf_set_d(nt1, 1.0 / sqrt((double)x));
+
+	while (prec < prec0) {
+		prec *= 2;
+		if (prec < prec0) {
+			/* nt1 = nt1 + nt1*(1 - x*nt1*nt1)/2 */
+			mpf_set_prec_raw(nt2, prec);
+			mpf_mul(nt2, nt1, nt1);
+			mpf_mul_ui(nt2, nt2, x);
+			mpf_ui_sub(nt2, 1, nt2);
+			mpf_set_prec_raw(nt2, prec / 2);
+			mpf_div_2exp(nt2, nt2, 1);
+			mpf_mul(nt2, nt2, nt1);
+			mpf_set_prec_raw(nt1, prec);
+			mpf_add(nt1, nt1, nt2);
+		} else {
+			break;
+		}
+		prec -= (bits & 1);
+		bits /= 2;
+	}
+	/* nt2 = x*nt1, r = nt2 + nt1*(x - nt2*nt2)/2 */
+	mpf_set_prec_raw(nt2, prec0 / 2);
+	mpf_mul_ui(nt2, nt1, x);
+	mpf_mul(r, nt2, nt2);
+	mpf_ui_sub(r, x, r);
+	mpf_mul(nt1, nt1, r);
+	mpf_div_2exp(nt1, nt1, 1);
+	mpf_add(r, nt1, nt2);
+}
+
+/* ── Final pi computation ──────────────────────────────────────────────── */
+/* Combines: Q * (C/D) * sqrt(C) / T
+ * where C=640320, D=12, C/D=53360.
+ * Does Q *= C/D in integer space to save a float multiply.
+ * Uses Newton sqrt for speed. Called from LLVM IR after binary_split. */
+
+#define C 640320
+#define D 12
+
+long pi_final(long digits, char *buf, long buf_len)
+{
+	/* log2(10) ≈ 3.32192809489; exact precision needed for decimal digits */
+	unsigned long prec = (unsigned long)(digits * 3.32192809489) + 256;
+	mpf_t pi_f, q_f, sqrt_f;
+
+	newton_init(prec);
+
+	/* Q *= C/D in integer space (cheaper than float mul_ui) */
+	mpz_mul_ui(qstack[0], qstack[0], C/D);
+
+	mpf_init2(pi_f, prec);
+	mpf_init2(q_f, prec);
+	mpf_init2(sqrt_f, prec);
+
+	mpf_set_z(q_f, qstack[0]);
+
+	/* Division: pi_f = Q*(C/D) / T */
+	{
+		mpf_t t_f;
+		mpf_init2(t_f, prec);
+		mpf_set_z(t_f, tstack[0]);
+		mpf_div(pi_f, q_f, t_f);
+		mpf_clear(t_f);
+	}
+
+	/* sqrt(C) via Newton's method */
+	my_sqrt_ui(sqrt_f, C);
+
+	/* pi = Q*(C/D)/T * sqrt(C) — single float multiply */
+	mpf_mul(pi_f, pi_f, sqrt_f);
+
+	/* Format to string using mpf_get_str */
+	{
+		mp_exp_t exp;
+		char *str = mpf_get_str(NULL, &exp, 10, digits + 2, pi_f);
+		buf[0] = str[0];
+		buf[1] = '.';
+		long copy_digits = digits;
+		long str_len = (long)strlen(str);
+		if (copy_digits > str_len - 1) copy_digits = str_len - 1;
+		memcpy(buf + 2, str + 1, copy_digits);
+		buf[copy_digits + 2] = '\0';
+		free(str);
+	}
+	long copy_len = digits + 2;
+	mpf_clear(pi_f);
+	mpf_clear(q_f);
+	mpf_clear(sqrt_f);
+	newton_free();
+
+	return copy_len;
+}
+
+/* ── Full pi computation ───────────────────────────────────────────────── */
+/* Called from LLVM IR compute_pi. Handles everything: sieve, split, final. */
+
+#define DIGITS_PER_ITER 14.1816474627254776555
+
+long compute_pi_c(long digits, char *buf, long buf_len)
+{
+	long N = (long)(digits / DIGITS_PER_ITER) + 1;
+	long sieve_sz = N * 6;
+	if (sieve_sz < 10006) sieve_sz = 10006;
+
+	sieve_build(sieve_sz);
+	sieve_helpers_init();
+	stacks_init(N);
+
+	binary_split(N);
+
+	sieve_helpers_free();
+	sieve_free();
+
+	long result = pi_final(digits, buf, buf_len);
+
+	stacks_free();
+	return result;
+}
