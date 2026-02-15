@@ -31,11 +31,29 @@ echo "Building with -mcpu=$MCPU $OPT"
 # Assemble LLVM IR to object file
 nix develop -c llc "$OPT" -mcpu="$MCPU" $TRIPLE -filetype=obj chudnovsky.ll -o chudnovsky.o
 
-# Compile C (sieve.c gets -O3 + LTO for maximum performance)
-nix develop -c clang "$OPT" -flto -I"$GMP_INCLUDE" -c main.c -o main.o
-nix develop -c clang -O3 -flto -I"$GMP_INCLUDE" -c sieve.c -o sieve.o
+if [[ "${PGO:-}" == "1" ]]; then
+	echo "Building with PGO (two-pass)..."
 
-# Link with LTO for cross-module inlining
-nix develop -c clang "$OPT" -flto main.o chudnovsky.o sieve.o -L"$GMP_LIB" -lgmp -o pi
+	# Pass 1: instrumented build
+	nix develop -c clang "$OPT" -flto -fprofile-generate -I"$GMP_INCLUDE" -c main.c -o main.o
+	nix develop -c clang -O3 -flto -fprofile-generate -I"$GMP_INCLUDE" -c sieve.c -o sieve.o
+	nix develop -c clang "$OPT" -flto -fprofile-generate main.o chudnovsky.o sieve.o -L"$GMP_LIB" -lgmp -o pi
+
+	# Profile run
+	./pi 1000000 > /dev/null
+	nix develop -c llvm-profdata merge -output=default.profdata *.profraw
+	rm -f *.profraw
+
+	# Pass 2: optimized build
+	nix develop -c clang "$OPT" -flto -fprofile-use=default.profdata -I"$GMP_INCLUDE" -c main.c -o main.o
+	nix develop -c clang -O3 -flto -fprofile-use=default.profdata -I"$GMP_INCLUDE" -c sieve.c -o sieve.o
+	nix develop -c clang "$OPT" -flto -fprofile-use=default.profdata main.o chudnovsky.o sieve.o -L"$GMP_LIB" -lgmp -o pi
+	rm -f default.profdata
+else
+	# Standard build with LTO
+	nix develop -c clang "$OPT" -flto -I"$GMP_INCLUDE" -c main.c -o main.o
+	nix develop -c clang -O3 -flto -I"$GMP_INCLUDE" -c sieve.c -o sieve.o
+	nix develop -c clang "$OPT" -flto main.o chudnovsky.o sieve.o -L"$GMP_LIB" -lgmp -o pi
+fi
 
 echo "Built: ./pi"

@@ -32,7 +32,7 @@ static long sieve_size;
 /* Build prime factorization sieve for odd numbers up to n.
  * After building, sieve[k/2] gives the smallest prime factor of k,
  * its power, and a link to the remaining factorization. */
-void sieve_build(long n)
+static void sieve_build(long n)
 {
 	long m, i, j, k;
 
@@ -66,7 +66,7 @@ void sieve_build(long n)
 	}
 }
 
-void sieve_free(void)
+static void sieve_free(void)
 {
 	free(sieve);
 	sieve = NULL;
@@ -88,7 +88,7 @@ typedef struct {
 static fac_s ftmp;  /* scratch for fac_mul_bp */
 static fac_s fmul;  /* scratch for fac_mul and fac_remove_gcd */
 
-void fac_init(fac_s *f)
+static void fac_init(fac_s *f)
 {
 	f->fac = (unsigned long *)malloc(INIT_FACS * sizeof(unsigned long) * 2);
 	f->pow = f->fac + INIT_FACS;
@@ -96,14 +96,14 @@ void fac_init(fac_s *f)
 	f->num_facs = 0;
 }
 
-void fac_clear(fac_s *f)
+static void fac_clear(fac_s *f)
 {
 	free(f->fac);
 	f->fac = NULL;
 	f->pow = NULL;
 }
 
-void fac_reset(fac_s *f)
+static void fac_reset(fac_s *f)
 {
 	f->num_facs = 0;
 }
@@ -120,7 +120,7 @@ static void fac_resize(fac_s *f, long s)
 }
 
 /* f = base^pow, factorized using the sieve */
-void fac_set_bp(fac_s *f, unsigned long base, long pow)
+static void fac_set_bp(fac_s *f, unsigned long base, long pow)
 {
 	long i;
 	assert(base < (unsigned long)sieve_size);
@@ -165,7 +165,7 @@ static void fac_mul2(fac_s *r, fac_s *f, fac_s *g)
 }
 
 /* f *= g */
-void fac_mul(fac_s *f, fac_s *g)
+static void fac_mul(fac_s *f, fac_s *g)
 {
 	fac_s tmp;
 	fac_resize(&fmul, f->num_facs + g->num_facs);
@@ -176,7 +176,7 @@ void fac_mul(fac_s *f, fac_s *g)
 }
 
 /* f *= base^pow */
-void fac_mul_bp(fac_s *f, unsigned long base, unsigned long pow)
+static void fac_mul_bp(fac_s *f, unsigned long base, unsigned long pow)
 {
 	fac_set_bp(&ftmp, base, pow);
 	fac_mul(f, &ftmp);
@@ -223,7 +223,7 @@ static int gcd_initialized = 0;
 /* Remove GCD(fp, fg) from both p and g.
  * fp and fg are updated (common powers subtracted).
  * p and g are divided by the computed GCD. */
-void fac_remove_gcd(mpz_ptr p, fac_s *fp, mpz_ptr g, fac_s *fg)
+static void fac_remove_gcd(mpz_ptr p, fac_s *fp, mpz_ptr g, fac_s *fg)
 {
 	unsigned long i, j, k, c;
 
@@ -262,14 +262,14 @@ void fac_remove_gcd(mpz_ptr p, fac_s *fp, mpz_ptr g, fac_s *fg)
 }
 
 /* Initialize scratch variables. Call once before using fac_mul or fac_remove_gcd. */
-void sieve_helpers_init(void)
+static void sieve_helpers_init(void)
 {
 	fac_init(&ftmp);
 	fac_init(&fmul);
 }
 
 /* Free scratch variables. */
-void sieve_helpers_free(void)
+static void sieve_helpers_free(void)
 {
 	fac_clear(&ftmp);
 	fac_clear(&fmul);
@@ -280,11 +280,14 @@ void sieve_helpers_free(void)
 }
 
 /* ── Pre-allocated recursion stacks ─────────────────────────────────────── */
-/* Eliminates malloc/free per recursion level in binary splitting.
- * The LLVM IR split function indexes into these arrays by level. */
+/* Array-of-structs layout for cache locality: all data for a level is contiguous. */
 
-static mpz_t *pstack, *qstack, *tstack, *gstack;
-static fac_s *fpstack, *fgstack;
+typedef struct {
+	mpz_t q, t, g;
+	fac_s fp, fg;
+} bs_level_t;
+
+static bs_level_t *bs_stack;
 static long stack_depth;
 
 /* Compute recursion depth for asymmetric split (ratio 0.5224).
@@ -292,161 +295,113 @@ static long stack_depth;
 static long compute_depth(long terms)
 {
 	if (terms <= 1) return 2;
-	/* log(terms) / log(1/0.5224) ≈ log(terms) / 0.6491 */
 	long depth = (long)(log((double)terms) / log(1.0/0.5224)) + 4;
 	return depth;
 }
 
 /* Allocate stacks for binary splitting. Call after sieve_build. */
-void stacks_init(long terms)
+static void stacks_init(long terms)
 {
 	long i;
 	stack_depth = compute_depth(terms);
-	pstack = (mpz_t *)malloc(sizeof(mpz_t) * stack_depth);
-	qstack = (mpz_t *)malloc(sizeof(mpz_t) * stack_depth);
-	tstack = (mpz_t *)malloc(sizeof(mpz_t) * stack_depth);
-	gstack = (mpz_t *)malloc(sizeof(mpz_t) * stack_depth);
-	fpstack = (fac_s *)malloc(sizeof(fac_s) * stack_depth);
-	fgstack = (fac_s *)malloc(sizeof(fac_s) * stack_depth);
+	bs_stack = (bs_level_t *)malloc(sizeof(bs_level_t) * stack_depth);
 	for (i = 0; i < stack_depth; i++) {
-		mpz_init(pstack[i]);
-		mpz_init(qstack[i]);
-		mpz_init(tstack[i]);
-		mpz_init(gstack[i]);
-		fac_init(&fpstack[i]);
-		fac_init(&fgstack[i]);
+		mpz_init(bs_stack[i].q);
+		mpz_init(bs_stack[i].t);
+		mpz_init(bs_stack[i].g);
+		fac_init(&bs_stack[i].fp);
+		fac_init(&bs_stack[i].fg);
 	}
 }
 
 /* Free stacks. */
-void stacks_free(void)
+static void stacks_free(void)
 {
 	long i;
 	for (i = 0; i < stack_depth; i++) {
-		mpz_clear(pstack[i]);
-		mpz_clear(qstack[i]);
-		mpz_clear(tstack[i]);
-		mpz_clear(gstack[i]);
-		fac_clear(&fpstack[i]);
-		fac_clear(&fgstack[i]);
+		mpz_clear(bs_stack[i].q);
+		mpz_clear(bs_stack[i].t);
+		mpz_clear(bs_stack[i].g);
+		fac_clear(&bs_stack[i].fp);
+		fac_clear(&bs_stack[i].fg);
 	}
-	free(pstack);
-	free(qstack);
-	free(tstack);
-	free(gstack);
-	free(fpstack);
-	free(fgstack);
+	free(bs_stack);
 }
 
-/* Get result pointers (level 0 = final results after bs runs) */
-mpz_ptr stack_q(long level) { return qstack[level]; }
-mpz_ptr stack_t_val(long level) { return tstack[level]; }
-
-/* ── Binary splitting (iterative via explicit stack) ───────────────────── */
+/* ── Binary splitting ──────────────────────────────────────────────────── */
 
 /* Current stack position. Left child reuses top; right child uses top+1. */
 static long top = 0;
 
 /* Convenience macros for current and next stack level */
-#define p1 (pstack[top])
-#define q1 (qstack[top])
-#define t1 (tstack[top])
-#define g1 (gstack[top])
-#define fp1 (fpstack[top])
-#define fg1 (fgstack[top])
+#define q1 (bs_stack[top].q)
+#define t1 (bs_stack[top].t)
+#define g1 (bs_stack[top].g)
+#define fp1 (bs_stack[top].fp)
+#define fg1 (bs_stack[top].fg)
 
-#define p2 (pstack[top+1])
-#define q2 (qstack[top+1])
-#define t2 (tstack[top+1])
-#define g2 (gstack[top+1])
-#define fp2 (fpstack[top+1])
-#define fg2 (fgstack[top+1])
+#define q2 (bs_stack[top+1].q)
+#define t2 (bs_stack[top+1].t)
+#define g2 (bs_stack[top+1].g)
+#define fp2 (bs_stack[top+1].fp)
+#define fg2 (bs_stack[top+1].fg)
 
 /*
- * base_case_c: compute single Chudnovsky term for index b.
- *   Stores into pstack[top], qstack[top], tstack[top], gstack[top],
- *   fpstack[top], fgstack[top].
- *
- * Our naming (matches the LLVM IR convention):
- *   P = (6b-5)(2b-1)(6b-1)  [linear product]
- *   Q = b^3 * C^3/24        [cubic product]
- *   T = P * (A + B*b) * (-1)^b  [accumulated sum]
- *   G = P                   [copy for merge]
- *
- * b=0 special case: P=1, Q=1, T=A, G=1
- */
-static void base_case_c(unsigned long b)
-{
-	unsigned long i;
-
-	if (b == 0) {
-		mpz_set_ui(p1, 1);
-		mpz_set_ui(q1, 1);
-		mpz_set_si(t1, 13591409L);
-		mpz_set_ui(g1, 1);
-		fac_reset(&fp1);
-		fac_reset(&fg1);
-		return;
-	}
-
-	/* P = (6b-5)(2b-1)(6b-1) */
-	mpz_set_ui(g1, 2*b-1);
-	mpz_mul_ui(g1, g1, 6*b-1);
-	mpz_mul_ui(g1, g1, 6*b-5);
-
-	/* Q = b^3 * C^3/24 = b^3 * 10939058860032000 */
-	mpz_set_ui(q1, b);
-	mpz_mul_ui(q1, q1, b);
-	mpz_mul_ui(q1, q1, b);
-	mpz_mul_ui(q1, q1, (640320UL/24)*(640320UL/24));
-	mpz_mul_ui(q1, q1, 640320UL*24);
-
-	/* T = P * (A + B*b) * (-1)^b */
-	mpz_set_ui(t1, b);
-	mpz_mul_ui(t1, t1, 545140134UL);
-	mpz_add_ui(t1, t1, 13591409UL);
-	mpz_mul(t1, t1, g1);
-	if (b % 2)
-		mpz_neg(t1, t1);
-
-	/* P = Q for storage (we don't actually need P after this) */
-	mpz_set(p1, q1);
-
-	/* Factorized form of Q: strip factors of 2 from b, then (b_odd)^3 * (10005)^3 / 3 */
-	i = b;
-	while ((i & 1) == 0) i >>= 1;
-	fac_set_bp(&fp1, i, 3);
-	fac_mul_bp(&fp1, 3*5*23*29, 3);
-	fp1.pow[0]--;
-
-	/* Factorized form of G = (2b-1)(6b-1)(6b-5) */
-	fac_set_bp(&fg1, 2*b-1, 1);
-	fac_mul_bp(&fg1, 6*b-1, 1);
-	fac_mul_bp(&fg1, 6*b-5, 1);
-}
-
-/*
- * bs: binary splitting over [a, b) with pre-allocated stacks.
- * Recursive but uses explicit top counter — NOT call-stack dependent
- * for data storage. Left child reuses top, right child uses top+1.
+ * bs: binary splitting over terms (a, b] (1-indexed).
+ * Recursive with explicit top counter for stack indexing.
+ * Left child reuses top, right child uses top+1.
  *
  * gflag: 1 = maintain G (needed by caller's merge), 0 = skip
  * level: recursion depth (for GCD threshold)
  *
- * After return, results are in pstack[top]/qstack[top]/tstack[top]/gstack[top].
+ * After return, results are in qstack[top]/tstack[top]/gstack[top].
  */
+__attribute__((flatten))
 static void bs(unsigned long a, unsigned long b, int gflag, long level)
 {
 	unsigned long mid;
 
 	if (b - a == 1) {
-		base_case_c(a);
+		/*
+		 * Base case: single Chudnovsky term for 1-indexed term b.
+		 *   Q = b^3 * C^3/24
+		 *   G = (6b-5)(2b-1)(6b-1)
+		 *   T = G * (A + B*b) * (-1)^b
+		 */
+		unsigned long i;
+
+		mpz_set_ui(q1, b);
+		mpz_mul_ui(q1, q1, b);
+		mpz_mul_ui(q1, q1, b);
+		mpz_mul_ui(q1, q1, (640320UL/24)*(640320UL/24));
+		mpz_mul_ui(q1, q1, 640320UL*24);
+
+		mpz_set_ui(g1, 2*b-1);
+		mpz_mul_ui(g1, g1, 6*b-1);
+		mpz_mul_ui(g1, g1, 6*b-5);
+
+		mpz_set_ui(t1, b);
+		mpz_mul_ui(t1, t1, 545140134UL);
+		mpz_add_ui(t1, t1, 13591409UL);
+		mpz_mul(t1, t1, g1);
+		if (b % 2)
+			mpz_neg(t1, t1);
+
+		i = b;
+		while ((i & 1) == 0) i >>= 1;
+		fac_set_bp(&fp1, i, 3);
+		fac_mul_bp(&fp1, 3*5*23*29, 3);
+		fp1.pow[0]--;
+
+		fac_set_bp(&fg1, 2*b-1, 1);
+		fac_mul_bp(&fg1, 6*b-1, 1);
+		fac_mul_bp(&fg1, 6*b-5, 1);
 		return;
 	}
 
 	/* Asymmetric split (tuning parameter from gmp-chudnovsky) */
 	mid = a + (unsigned long)((b - a) * 0.5224);
-	if (mid == a) mid = a + 1;   /* safety: ensure progress */
+	if (mid == a) mid = a + 1;
 	if (mid >= b) mid = b - 1;
 
 	/* Left half: always maintain G (needed for merge) */
@@ -481,10 +436,11 @@ static void bs(unsigned long a, unsigned long b, int gflag, long level)
 }
 
 /*
- * binary_split: entry point called from LLVM IR.
- * Runs the full binary splitting, results in qstack[0] (Q) and tstack[0] (T).
+ * binary_split: entry point.
+ * Splits terms 1..N. Results in bs_stack[0].q (Q) and bs_stack[0].t (T).
+ * The k=0 term (constant A) is added in pi_final.
  */
-void binary_split(long N)
+static void binary_split(long N)
 {
 	top = 0;
 	bs(0, (unsigned long)N, 0, 0);
@@ -584,20 +540,23 @@ long pi_final(long digits, char *buf, long buf_len)
 
 	newton_init(prec);
 
+	/* Add k=0 term: T += A*Q (integer addmul, since k=0 not in binary split) */
+	mpz_addmul_ui(bs_stack[0].t, bs_stack[0].q, 13591409UL);
+
 	/* Q *= C/D in integer space (cheaper than float mul_ui) */
-	mpz_mul_ui(qstack[0], qstack[0], C/D);
+	mpz_mul_ui(bs_stack[0].q, bs_stack[0].q, C/D);
 
 	mpf_init2(pi_f, prec);
 	mpf_init2(q_f, prec);
 	mpf_init2(sqrt_f, prec);
 
-	mpf_set_z(q_f, qstack[0]);
+	mpf_set_z(q_f, bs_stack[0].q);
 
 	/* Division: pi_f = Q*(C/D) / T */
 	{
 		mpf_t t_f;
 		mpf_init2(t_f, prec);
-		mpf_set_z(t_f, tstack[0]);
+		mpf_set_z(t_f, bs_stack[0].t);
 		mpf_div(pi_f, q_f, t_f);
 		mpf_clear(t_f);
 	}
