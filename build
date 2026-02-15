@@ -33,8 +33,9 @@ nix develop -c llc "$OPT" -mcpu="$MCPU" $TRIPLE -filetype=obj chudnovsky.ll -o c
 
 # Compile C
 nix develop -c clang "$OPT" -I"$GMP_INCLUDE" -c main.c -o main.o
+nix develop -c clang "$OPT" -I"$GMP_INCLUDE" -c sieve.c -o sieve.o
 
 # Link
-nix develop -c clang "$OPT" main.o chudnovsky.o -L"$GMP_LIB" -lgmp -o pi
+nix develop -c clang "$OPT" main.o chudnovsky.o sieve.o -L"$GMP_LIB" -lgmp -o pi
 
 echo "Built: ./pi"
