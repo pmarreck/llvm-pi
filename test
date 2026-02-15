@@ -12,7 +12,7 @@ run_test() {
 	local label="$2"
 	# Expected: "3." + first $digits decimal digits from reference
 	local expected
-	expected="$(echo "$PI_REF" | head -c $((digits + 2)))"  # "3." = 2 chars
+	expected="${PI_REF:0:$((digits + 2))}"  # "3." = 2 chars
 
 	local actual
 	actual="$(nix develop -c ./pi "$digits" 2>&1)" || {
@@ -53,6 +53,8 @@ echo "=== Running tests ==="
 run_test 50 "sanity-50"
 run_test 100 "basic-100"
 run_test 1000 "medium-1000"
+run_test 10000 "stress-10k"
+run_test 100000 "stress-100k"
 
 echo
 echo "=== Results: $PASS passed, $FAIL failed ==="
