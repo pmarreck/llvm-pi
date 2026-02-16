@@ -16,7 +16,18 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <gmp.h>
+#include <pthread.h>
+
+#ifdef PHASE_TIMING
+#include <stdio.h>
+static double phase_now(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
+	return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+#endif
 
 /* ── Sieve data structure ─────────────────────────────────────────────── */
 
@@ -85,8 +96,8 @@ typedef struct {
 
 #define INIT_FACS 32
 
-static fac_s ftmp;  /* scratch for fac_mul_bp */
-static fac_s fmul;  /* scratch for fac_mul and fac_remove_gcd */
+static __thread fac_s ftmp;  /* scratch for fac_mul_bp (thread-local for parallel bs) */
+static __thread fac_s fmul;  /* scratch for fac_mul and fac_remove_gcd (thread-local) */
 
 static void fac_init(fac_s *f)
 {
@@ -120,7 +131,7 @@ static void fac_resize(fac_s *f, long s)
 }
 
 /* f = base^pow, factorized using the sieve */
-static void fac_set_bp(fac_s *f, unsigned long base, long pow)
+void fac_set_bp(fac_s *f, unsigned long base, long pow)
 {
 	long i;
 	assert(base < (unsigned long)sieve_size);
@@ -165,7 +176,7 @@ static void fac_mul2(fac_s *r, fac_s *f, fac_s *g)
 }
 
 /* f *= g */
-static void fac_mul(fac_s *f, fac_s *g)
+void fac_mul(fac_s *f, fac_s *g)
 {
 	fac_s tmp;
 	fac_resize(&fmul, f->num_facs + g->num_facs);
@@ -176,7 +187,7 @@ static void fac_mul(fac_s *f, fac_s *g)
 }
 
 /* f *= base^pow */
-static void fac_mul_bp(fac_s *f, unsigned long base, unsigned long pow)
+void fac_mul_bp(fac_s *f, unsigned long base, unsigned long pow)
 {
 	fac_set_bp(&ftmp, base, pow);
 	fac_mul(f, &ftmp);
@@ -217,13 +228,13 @@ static void bs_mul(mpz_t r, long a, long b)
 	}
 }
 
-static mpz_t gcd_val;
-static int gcd_initialized = 0;
+static __thread mpz_t gcd_val;
+static __thread int gcd_initialized = 0;
 
 /* Remove GCD(fp, fg) from both p and g.
  * fp and fg are updated (common powers subtracted).
  * p and g are divided by the computed GCD. */
-static void fac_remove_gcd(mpz_ptr p, fac_s *fp, mpz_ptr g, fac_s *fg)
+void fac_remove_gcd(mpz_ptr p, fac_s *fp, mpz_ptr g, fac_s *fg)
 {
 	unsigned long i, j, k, c;
 
@@ -287,8 +298,8 @@ typedef struct {
 	fac_s fp, fg;
 } bs_level_t;
 
-static bs_level_t *bs_stack;
-static long stack_depth;
+__thread bs_level_t *bs_stack;
+static __thread long stack_depth;
 
 /* Compute recursion depth for asymmetric split (ratio 0.5224).
  * Max depth = ceil(log(terms) / log(1/0.5224)) + safety margin. */
@@ -306,9 +317,13 @@ static void stacks_init(long terms)
 	stack_depth = compute_depth(terms);
 	bs_stack = (bs_level_t *)malloc(sizeof(bs_level_t) * stack_depth);
 	for (i = 0; i < stack_depth; i++) {
-		mpz_init(bs_stack[i].q);
-		mpz_init(bs_stack[i].t);
-		mpz_init(bs_stack[i].g);
+		/* Pre-allocate 128 bits (2 limbs) so hand-written LLVM IR can
+		   write directly to the limb data without triggering GMP realloc.
+		   Base case Q/G/T all fit in 2 limbs; GMP will grow as needed
+		   for larger merge results at higher recursion levels. */
+		mpz_init2(bs_stack[i].q, 128);
+		mpz_init2(bs_stack[i].t, 128);
+		mpz_init2(bs_stack[i].g, 128);
 		fac_init(&bs_stack[i].fp);
 		fac_init(&bs_stack[i].fg);
 	}
@@ -330,120 +345,140 @@ static void stacks_free(void)
 
 /* ── Binary splitting ──────────────────────────────────────────────────── */
 
-/* Current stack position. Left child reuses top; right child uses top+1. */
-static long top = 0;
+/* Current stack position (non-static: accessed from hand-written LLVM IR).
+ * Thread-local for parallel binary splitting. */
+__thread long top = 0;
 
-/* Convenience macros for current and next stack level */
-#define q1 (bs_stack[top].q)
-#define t1 (bs_stack[top].t)
-#define g1 (bs_stack[top].g)
-#define fp1 (bs_stack[top].fp)
-#define fg1 (bs_stack[top].fg)
+/* bs() and binary_split() are implemented in hand-tuned LLVM IR (chudnovsky.ll).
+ * The IR loads @bs_stack and @top once per call, eliminating ~30 redundant
+ * global reloads per base case that the C compiler conservatively inserts
+ * after every GMP function call. */
+extern void binary_split(long N);
+extern void bs(long a, long b, int gflag, long level);
 
-#define q2 (bs_stack[top+1].q)
-#define t2 (bs_stack[top+1].t)
-#define g2 (bs_stack[top+1].g)
-#define fp2 (bs_stack[top+1].fp)
-#define fg2 (bs_stack[top+1].fg)
+/* ── Parallel binary splitting ─────────────────────────────────────────── */
+/* Split work into chunks, each computed by a separate thread.
+ * Controlled by PI_THREADS environment variable (default: 1).
+ * Each thread gets its own TLS bs_stack/top/fac_s scratch. */
 
-/*
- * bs: binary splitting over terms (a, b] (1-indexed).
- * Recursive with explicit top counter for stack indexing.
- * Left child reuses top, right child uses top+1.
- *
- * gflag: 1 = maintain G (needed by caller's merge), 0 = skip
- * level: recursion depth (for GCD threshold)
- *
- * After return, results are in qstack[top]/tstack[top]/gstack[top].
- */
-__attribute__((flatten))
-static void bs(unsigned long a, unsigned long b, int gflag, long level)
+#include <stdio.h>
+
+typedef struct {
+	long a, b;        /* half-open interval of terms */
+	long terms;       /* b - a, for stack depth */
+	mpz_t q, t, g;   /* results (pre-initialized by main thread) */
+} chunk_t;
+
+static void *bs_worker(void *arg)
 {
-	unsigned long mid;
+	chunk_t *chunk = (chunk_t *)arg;
+	long depth = compute_depth(chunk->terms);
+	long i;
 
-	if (b - a == 1) {
-		/*
-		 * Base case: single Chudnovsky term for 1-indexed term b.
-		 *   Q = b^3 * C^3/24
-		 *   G = (6b-5)(2b-1)(6b-1)
-		 *   T = G * (A + B*b) * (-1)^b
-		 */
-		unsigned long i;
+	/* Initialize thread-local state */
+	bs_stack = (bs_level_t *)malloc(sizeof(bs_level_t) * depth);
+	stack_depth = depth;
+	for (i = 0; i < depth; i++) {
+		mpz_init2(bs_stack[i].q, 128);
+		mpz_init2(bs_stack[i].t, 128);
+		mpz_init2(bs_stack[i].g, 128);
+		fac_init(&bs_stack[i].fp);
+		fac_init(&bs_stack[i].fg);
+	}
+	fac_init(&ftmp);
+	fac_init(&fmul);
+	gcd_initialized = 0;
+	top = 0;
 
-		mpz_set_ui(q1, b);
-		mpz_mul_ui(q1, q1, b);
-		mpz_mul_ui(q1, q1, b);
-		mpz_mul_ui(q1, q1, (640320UL/24)*(640320UL/24));
-		mpz_mul_ui(q1, q1, 640320UL*24);
+	/* Compute this chunk (gflag=1: merge needs G) */
+	bs(chunk->a, chunk->b, 1, 0);
 
-		mpz_set_ui(g1, 2*b-1);
-		mpz_mul_ui(g1, g1, 6*b-1);
-		mpz_mul_ui(g1, g1, 6*b-5);
+	/* Transfer results via swap (O(1), no limb copying) */
+	mpz_swap(chunk->q, bs_stack[0].q);
+	mpz_swap(chunk->t, bs_stack[0].t);
+	mpz_swap(chunk->g, bs_stack[0].g);
 
-		mpz_set_ui(t1, b);
-		mpz_mul_ui(t1, t1, 545140134UL);
-		mpz_add_ui(t1, t1, 13591409UL);
-		mpz_mul(t1, t1, g1);
-		if (b % 2)
-			mpz_neg(t1, t1);
-
-		i = b;
-		while ((i & 1) == 0) i >>= 1;
-		fac_set_bp(&fp1, i, 3);
-		fac_mul_bp(&fp1, 3*5*23*29, 3);
-		fp1.pow[0]--;
-
-		fac_set_bp(&fg1, 2*b-1, 1);
-		fac_mul_bp(&fg1, 6*b-1, 1);
-		fac_mul_bp(&fg1, 6*b-5, 1);
-		return;
+	/* Cleanup thread-local state */
+	for (i = 0; i < depth; i++) {
+		mpz_clear(bs_stack[i].q);
+		mpz_clear(bs_stack[i].t);
+		mpz_clear(bs_stack[i].g);
+		fac_clear(&bs_stack[i].fp);
+		fac_clear(&bs_stack[i].fg);
+	}
+	free(bs_stack);
+	bs_stack = NULL;
+	fac_clear(&ftmp);
+	fac_clear(&fmul);
+	if (gcd_initialized) {
+		mpz_clear(gcd_val);
+		gcd_initialized = 0;
 	}
 
-	/* Asymmetric split (tuning parameter from gmp-chudnovsky) */
-	mid = a + (unsigned long)((b - a) * 0.5224);
-	if (mid == a) mid = a + 1;
-	if (mid >= b) mid = b - 1;
-
-	/* Left half: always maintain G (needed for merge) */
-	bs(a, mid, 1, level + 1);
-
-	/* Right half: uses top+1 */
-	top++;
-	bs(mid, b, gflag, level + 1);
-	top--;
-
-	/* GCD removal at depth >= 4 */
-	if (level >= 4) {
-		fac_remove_gcd(q2, &fp2, g1, &fg1);
-	}
-
-	/* Merge:
-	 *   T = T_L * Q_R + G_L * T_R
-	 *   Q = Q_L * Q_R
-	 *   G = G_L * G_R (if gflag)
-	 */
-	mpz_mul(t1, t1, q2);
-	mpz_mul(t2, t2, g1);
-	mpz_add(t1, t1, t2);
-	mpz_mul(q1, q1, q2);
-
-	fac_mul(&fp1, &fp2);
-
-	if (gflag) {
-		mpz_mul(g1, g1, g2);
-		fac_mul(&fg1, &fg2);
-	}
+	return NULL;
 }
 
-/*
- * binary_split: entry point.
- * Splits terms 1..N. Results in bs_stack[0].q (Q) and bs_stack[0].t (T).
- * The k=0 term (constant A) is added in pi_final.
- */
-static void binary_split(long N)
+static void parallel_binary_split(long N, int n_threads)
 {
+	chunk_t *chunks;
+	pthread_t *threads;
+	int i;
+
+	chunks = (chunk_t *)malloc(n_threads * sizeof(chunk_t));
+	threads = (pthread_t *)malloc((n_threads - 1) * sizeof(pthread_t));
+
+	/* Divide terms into chunks */
+	for (i = 0; i < n_threads; i++) {
+		chunks[i].a = (long)i * N / n_threads;
+		chunks[i].b = (long)(i + 1) * N / n_threads;
+		chunks[i].terms = chunks[i].b - chunks[i].a;
+		mpz_init(chunks[i].q);
+		mpz_init(chunks[i].t);
+		mpz_init(chunks[i].g);
+	}
+
+	/* Spawn worker threads for chunks 1..n_threads-1 */
+	for (i = 1; i < n_threads; i++) {
+		pthread_create(&threads[i - 1], NULL, bs_worker, &chunks[i]);
+	}
+
+	/* Main thread does chunk 0 using its own TLS state */
 	top = 0;
-	bs(0, (unsigned long)N, 0, 0);
+	bs(chunks[0].a, chunks[0].b, 1, 0);
+	mpz_swap(chunks[0].q, bs_stack[0].q);
+	mpz_swap(chunks[0].t, bs_stack[0].t);
+	mpz_swap(chunks[0].g, bs_stack[0].g);
+
+	/* Wait for all workers */
+	for (i = 1; i < n_threads; i++) {
+		pthread_join(threads[i - 1], NULL);
+	}
+
+	/* Merge results sequentially: left-to-right accumulation
+	 * T = T_left * Q_right + G_left * T_right
+	 * Q = Q_left * Q_right
+	 * G = G_left * G_right (only if needed for next merge) */
+	for (i = 1; i < n_threads; i++) {
+		mpz_mul(chunks[0].t, chunks[0].t, chunks[i].q);
+		mpz_addmul(chunks[0].t, chunks[i].t, chunks[0].g);
+		mpz_mul(chunks[0].q, chunks[0].q, chunks[i].q);
+		if (i < n_threads - 1) {
+			mpz_mul(chunks[0].g, chunks[0].g, chunks[i].g);
+		}
+		mpz_clear(chunks[i].q);
+		mpz_clear(chunks[i].t);
+		mpz_clear(chunks[i].g);
+	}
+
+	/* Put merged result back in main thread's bs_stack[0] */
+	mpz_swap(bs_stack[0].q, chunks[0].q);
+	mpz_swap(bs_stack[0].t, chunks[0].t);
+	mpz_clear(chunks[0].q);
+	mpz_clear(chunks[0].t);
+	mpz_clear(chunks[0].g);
+
+	free(threads);
+	free(chunks);
 }
 
 /* ── Newton's method sqrt (precision doubling) ─────────────────────────── */
@@ -523,6 +558,164 @@ static void my_sqrt_ui(mpf_t r, unsigned long x)
 	mpf_add(r, nt1, nt2);
 }
 
+/* ── Binary-splitting base conversion ────────────────────────────────────── */
+/* Replaces GMP's mpf_get_str with a parallelizable divide-and-conquer
+ * algorithm. GMP's internal conversion is already subquadratic, but it
+ * cannot be parallelized. Our implementation enables multi-threaded
+ * formatting via the same PI_THREADS env var that controls binary splitting.
+ *
+ * Algorithm: precompute 10^(2^k) table, then recursively divide-and-conquer:
+ *   to_decimal(Z, n) = to_decimal(Z / 10^half, n-half) || to_decimal(Z % 10^half, half)
+ * Parallelism: after each split, spawn a thread for the larger half. */
+
+static mpz_t *fmt_pow10;
+static int fmt_depth;
+
+static void fmt_pow10_build(long digits)
+{
+	int depth = 0;
+	long d = 1;
+	while (d < digits) { d <<= 1; depth++; }
+	fmt_depth = depth;
+	fmt_pow10 = (mpz_t *)malloc((depth + 1) * sizeof(mpz_t));
+	mpz_init_set_ui(fmt_pow10[0], 10);
+	for (int k = 1; k <= depth; k++) {
+		mpz_init(fmt_pow10[k]);
+		mpz_mul(fmt_pow10[k], fmt_pow10[k - 1], fmt_pow10[k - 1]);
+	}
+}
+
+static void fmt_pow10_free(void)
+{
+	for (int k = 0; k <= fmt_depth; k++)
+		mpz_clear(fmt_pow10[k]);
+	free(fmt_pow10);
+	fmt_pow10 = NULL;
+}
+
+/* Compute 10^n from precomputed table by binary decomposition of n */
+static void fmt_pow10_exp(mpz_t result, long n)
+{
+	mpz_set_ui(result, 1);
+	int k = 0;
+	while (n > 0) {
+		if (n & 1) mpz_mul(result, result, fmt_pow10[k]);
+		n >>= 1;
+		k++;
+	}
+}
+
+#define FMT_BASE_CASE 1024
+
+/* Sequential binary-splitting conversion.
+ * Writes exactly ndigits decimal characters to buf, left-padded with '0'. */
+static void fmt_convert(char *buf, long ndigits, mpz_t z, int level)
+{
+	if (ndigits <= FMT_BASE_CASE) {
+		char *s = mpz_get_str(NULL, 10, z);
+		long len = (long)strlen(s);
+		long pad = ndigits - len;
+		if (pad > 0) memset(buf, '0', pad);
+		memcpy(buf + (pad > 0 ? pad : 0), s, len);
+		free(s);
+		return;
+	}
+
+	/* Find level where 2^(level-1) < ndigits */
+	while (level > 0 && (1L << (level - 1)) >= ndigits)
+		level--;
+	if (level <= 0) {
+		char *s = mpz_get_str(NULL, 10, z);
+		long len = (long)strlen(s);
+		long pad = ndigits - len;
+		if (pad > 0) memset(buf, '0', pad);
+		memcpy(buf + (pad > 0 ? pad : 0), s, len);
+		free(s);
+		return;
+	}
+
+	long half = 1L << (level - 1);
+	mpz_t q, r;
+	mpz_init(q);
+	mpz_init(r);
+	mpz_tdiv_qr(q, r, z, fmt_pow10[level - 1]);
+
+	fmt_convert(buf, ndigits - half, q, level - 1);
+	fmt_convert(buf + (ndigits - half), half, r, level - 1);
+
+	mpz_clear(q);
+	mpz_clear(r);
+}
+
+/* Tree-parallel conversion: after each split, spawn a thread for the right
+ * (larger) half and recurse on the left with remaining threads. */
+typedef struct {
+	char *buf;
+	long ndigits;
+	mpz_t z;
+	int level;
+	int n_threads;
+} fmt_par_t;
+
+static void fmt_par_convert(char *buf, long ndigits, mpz_t z,
+                            int level, int n_threads);
+
+static void *fmt_par_worker(void *arg)
+{
+	fmt_par_t *p = (fmt_par_t *)arg;
+	fmt_par_convert(p->buf, p->ndigits, p->z, p->level, p->n_threads);
+	return NULL;
+}
+
+static void fmt_par_convert(char *buf, long ndigits, mpz_t z,
+                            int level, int n_threads)
+{
+	if (n_threads <= 1 || ndigits <= FMT_BASE_CASE * 2) {
+		fmt_convert(buf, ndigits, z, level);
+		return;
+	}
+
+	/* Find split level */
+	while (level > 0 && (1L << (level - 1)) >= ndigits)
+		level--;
+	if (level <= 0) {
+		fmt_convert(buf, ndigits, z, level);
+		return;
+	}
+
+	long half = 1L << (level - 1);
+	mpz_t q, r;
+	mpz_init(q);
+	mpz_init(r);
+	mpz_tdiv_qr(q, r, z, fmt_pow10[level - 1]);
+
+	/* Allocate threads proportional to digit count */
+	long left_d = ndigits - half;
+	int right_t = (int)(0.5 + (double)half / ndigits * n_threads);
+	if (right_t < 1) right_t = 1;
+	if (right_t >= n_threads) right_t = n_threads - 1;
+	int left_t = n_threads - right_t;
+
+	/* Spawn thread for right (larger) half */
+	fmt_par_t right_arg;
+	right_arg.buf = buf + left_d;
+	right_arg.ndigits = half;
+	mpz_init_set(right_arg.z, r);
+	right_arg.level = level - 1;
+	right_arg.n_threads = right_t;
+
+	pthread_t thread;
+	pthread_create(&thread, NULL, fmt_par_worker, &right_arg);
+
+	/* Left half on current thread */
+	fmt_par_convert(buf, left_d, q, level - 1, left_t);
+
+	pthread_join(thread, NULL);
+	mpz_clear(right_arg.z);
+	mpz_clear(q);
+	mpz_clear(r);
+}
+
 /* ── Final pi computation ──────────────────────────────────────────────── */
 /* Combines: Q * (C/D) * sqrt(C) / T
  * where C=640320, D=12, C/D=53360.
@@ -537,6 +730,11 @@ long pi_final(long digits, char *buf, long buf_len)
 	/* log2(10) ≈ 3.32192809489; exact precision needed for decimal digits */
 	unsigned long prec = (unsigned long)(digits * 3.32192809489) + 256;
 	mpf_t pi_f, q_f, sqrt_f;
+
+#ifdef PHASE_TIMING
+	double pt0, pt1;
+	pt0 = phase_now();
+#endif
 
 	newton_init(prec);
 
@@ -561,25 +759,107 @@ long pi_final(long digits, char *buf, long buf_len)
 		mpf_clear(t_f);
 	}
 
+#ifdef PHASE_TIMING
+	pt1 = phase_now();
+	fprintf(stderr, "  div   time = %.3f\n", pt1 - pt0);
+	pt0 = pt1;
+#endif
+
 	/* sqrt(C) via Newton's method */
 	my_sqrt_ui(sqrt_f, C);
+
+#ifdef PHASE_TIMING
+	pt1 = phase_now();
+	fprintf(stderr, "  sqrt  time = %.3f\n", pt1 - pt0);
+	pt0 = pt1;
+#endif
 
 	/* pi = Q*(C/D)/T * sqrt(C) — single float multiply */
 	mpf_mul(pi_f, pi_f, sqrt_f);
 
-	/* Format to string using mpf_get_str */
+#ifdef PHASE_TIMING
+	pt1 = phase_now();
+	fprintf(stderr, "  mul   time = %.3f\n", pt1 - pt0);
+	pt0 = pt1;
+#endif
+
+	/* Format pi to decimal string */
 	{
-		mp_exp_t exp;
-		char *str = mpf_get_str(NULL, &exp, 10, digits + 2, pi_f);
-		buf[0] = str[0];
-		buf[1] = '.';
-		long copy_digits = digits;
-		long str_len = (long)strlen(str);
-		if (copy_digits > str_len - 1) copy_digits = str_len - 1;
-		memcpy(buf + 2, str + 1, copy_digits);
-		buf[copy_digits + 2] = '\0';
-		free(str);
+		int fmt_threads = 1;
+		{
+			const char *env = getenv("PI_THREADS");
+			if (env) fmt_threads = atoi(env);
+			if (fmt_threads < 1) fmt_threads = 1;
+		}
+
+		if (fmt_threads > 1) {
+			/* Parallel binary-splitting base conversion:
+			 * Scale pi to integer, then divide-and-conquer with threads. */
+			long guard = 5;
+			long total_d = digits + guard;
+
+			fmt_pow10_build(total_d + 1);
+
+#ifdef PHASE_TIMING
+			pt1 = phase_now();
+			fprintf(stderr, "  p10   time = %.3f\n", pt1 - pt0);
+			pt0 = pt1;
+#endif
+
+			/* Scale pi to integer: pi_z = floor(pi_f * 10^total_d) */
+			{
+				mpz_t ten_d;
+				mpz_init(ten_d);
+				fmt_pow10_exp(ten_d, total_d);
+
+				mpf_t sf;
+				mpf_init2(sf, prec + 64);
+				mpf_set_z(sf, ten_d);
+				mpf_mul(pi_f, pi_f, sf);
+				mpf_clear(sf);
+				mpz_clear(ten_d);
+			}
+
+			mpz_t pi_z;
+			mpz_init(pi_z);
+			mpz_set_f(pi_z, pi_f);
+
+#ifdef PHASE_TIMING
+			pt1 = phase_now();
+			fprintf(stderr, "  scale time = %.3f\n", pt1 - pt0);
+			pt0 = pt1;
+#endif
+
+			char *raw = (char *)malloc(total_d + 10);
+			fmt_par_convert(raw, total_d + 1, pi_z, fmt_depth, fmt_threads);
+			mpz_clear(pi_z);
+
+			buf[0] = raw[0];
+			buf[1] = '.';
+			memcpy(buf + 2, raw + 1, digits);
+			buf[digits + 2] = '\0';
+			free(raw);
+
+			fmt_pow10_free();
+		} else {
+			/* Single-threaded: use GMP's optimized mpf_get_str directly */
+			mp_exp_t exp;
+			char *str = mpf_get_str(NULL, &exp, 10, digits + 2, pi_f);
+			buf[0] = str[0];
+			buf[1] = '.';
+			long copy_digits = digits;
+			long str_len = (long)strlen(str);
+			if (copy_digits > str_len - 1) copy_digits = str_len - 1;
+			memcpy(buf + 2, str + 1, copy_digits);
+			buf[copy_digits + 2] = '\0';
+			free(str);
+		}
 	}
+
+#ifdef PHASE_TIMING
+	pt1 = phase_now();
+	fprintf(stderr, "  fmt   time = %.3f\n", pt1 - pt0);
+#endif
 	long copy_len = digits + 2;
 	mpf_clear(pi_f);
 	mpf_clear(q_f);
@@ -600,16 +880,49 @@ long compute_pi_c(long digits, char *buf, long buf_len)
 	long sieve_sz = N * 6;
 	if (sieve_sz < 10006) sieve_sz = 10006;
 
+#ifdef PHASE_TIMING
+	double t0, t1;
+	t0 = phase_now();
+#endif
+
 	sieve_build(sieve_sz);
 	sieve_helpers_init();
 	stacks_init(N);
 
-	binary_split(N);
+#ifdef PHASE_TIMING
+	t1 = phase_now();
+	fprintf(stderr, "sieve   time = %.3f\n", t1 - t0);
+	t0 = t1;
+#endif
+
+	{
+		int n_threads = 1;
+		const char *env = getenv("PI_THREADS");
+		if (env) n_threads = atoi(env);
+		if (n_threads < 1) n_threads = 1;
+
+		if (n_threads > 1) {
+			parallel_binary_split(N, n_threads);
+		} else {
+			binary_split(N);
+		}
+	}
+
+#ifdef PHASE_TIMING
+	t1 = phase_now();
+	fprintf(stderr, "bs      time = %.3f\n", t1 - t0);
+	t0 = t1;
+#endif
 
 	sieve_helpers_free();
 	sieve_free();
 
 	long result = pi_final(digits, buf, buf_len);
+
+#ifdef PHASE_TIMING
+	t1 = phase_now();
+	fprintf(stderr, "final   time = %.3f\n", t1 - t0);
+#endif
 
 	stacks_free();
 	return result;
