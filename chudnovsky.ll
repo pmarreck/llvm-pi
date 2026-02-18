@@ -71,6 +71,7 @@ declare void @__gmpz_addmul(ptr, ptr, ptr) nounwind
 
 declare void @fac_set_bp(ptr, i64, i64) nounwind
 declare void @fac_mul_bp(ptr, i64, i64) nounwind
+declare void @fac_mul_10005(ptr, i64) nounwind
 declare void @fac_mul(ptr, ptr) nounwind
 declare void @fac_remove_gcd(ptr, ptr, ptr, ptr) nounwind
 
@@ -173,7 +174,7 @@ entry:
   %tz = call i64 @llvm.cttz.i64(i64 %b, i1 true)
   %i = lshr i64 %b, %tz
   call void @fac_set_bp(ptr %fp1, i64 %i, i64 3)
-  call void @fac_mul_bp(ptr %fp1, i64 10005, i64 3)
+  call void @fac_mul_10005(ptr %fp1, i64 3)
   %pow_field = getelementptr inbounds %struct.fac_s, ptr %fp1, i32 0, i32 3
   %pow_ptr = load ptr, ptr %pow_field, align 8
   %pow0 = load i64, ptr %pow_ptr, align 8

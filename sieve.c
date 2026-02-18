@@ -193,6 +193,18 @@ void fac_mul_bp(fac_s *f, unsigned long base, unsigned long pow)
 	fac_mul(f, &ftmp);
 }
 
+/* Hardcoded factorization of 10005 = 3*5*23*29.
+ * Called ~700K times at 10M digits; avoids sieve walk each time. */
+static unsigned long fac_10005_facs[4] = {3, 5, 23, 29};
+
+void fac_mul_10005(fac_s *f, unsigned long pow)
+{
+	unsigned long pows[4] = {pow, pow, pow, pow};
+	fac_s tmp10k = { .max_facs = 4, .num_facs = 4,
+	                 .fac = fac_10005_facs, .pow = pows };
+	fac_mul(f, &tmp10k);
+}
+
 /* Remove factors of power 0 */
 static void fac_compact(fac_s *f)
 {

@@ -4,6 +4,8 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 OPT="${1:--O2}"
+EXTRA_CFLAGS=""
+[[ "${PHASE_TIMING:-}" == "1" ]] && EXTRA_CFLAGS="-DPHASE_TIMING"
 
 echo "Building with $OPT (LTO across all modules)"
 
@@ -16,8 +18,8 @@ if [[ "${PGO:-}" == "1" ]]; then
 	echo "Building with PGO (two-pass)..."
 
 	# Pass 1: instrumented build
-	nix develop -c clang "$OPT" -flto -fprofile-generate -I"$GMP_INCLUDE" -c main.c -o main.o
-	nix develop -c clang -O3 -flto -fprofile-generate -I"$GMP_INCLUDE" -c sieve.c -o sieve.o
+	nix develop -c clang "$OPT" -flto -fprofile-generate $EXTRA_CFLAGS -I"$GMP_INCLUDE" -c main.c -o main.o
+	nix develop -c clang -O3 -flto -fprofile-generate $EXTRA_CFLAGS -I"$GMP_INCLUDE" -c sieve.c -o sieve.o
 	nix develop -c clang "$OPT" -flto -fprofile-generate main.o chudnovsky.o sieve.o -L"$GMP_LIB" -lgmp -o pi
 
 	# Profile run
@@ -26,14 +28,14 @@ if [[ "${PGO:-}" == "1" ]]; then
 	rm -f *.profraw
 
 	# Pass 2: optimized build
-	nix develop -c clang "$OPT" -flto -fprofile-use=default.profdata -I"$GMP_INCLUDE" -c main.c -o main.o
-	nix develop -c clang -O3 -flto -fprofile-use=default.profdata -I"$GMP_INCLUDE" -c sieve.c -o sieve.o
+	nix develop -c clang "$OPT" -flto -fprofile-use=default.profdata $EXTRA_CFLAGS -I"$GMP_INCLUDE" -c main.c -o main.o
+	nix develop -c clang -O3 -flto -fprofile-use=default.profdata $EXTRA_CFLAGS -I"$GMP_INCLUDE" -c sieve.c -o sieve.o
 	nix develop -c clang "$OPT" -flto -fprofile-use=default.profdata main.o chudnovsky.o sieve.o -L"$GMP_LIB" -lgmp -o pi
 	rm -f default.profdata
 else
 	# Standard build with LTO
-	nix develop -c clang "$OPT" -flto -I"$GMP_INCLUDE" -c main.c -o main.o
-	nix develop -c clang -O3 -flto -I"$GMP_INCLUDE" -c sieve.c -o sieve.o
+	nix develop -c clang "$OPT" -flto $EXTRA_CFLAGS -I"$GMP_INCLUDE" -c main.c -o main.o
+	nix develop -c clang -O3 -flto $EXTRA_CFLAGS -I"$GMP_INCLUDE" -c sieve.c -o sieve.o
 	nix develop -c clang "$OPT" -flto main.o chudnovsky.o sieve.o -L"$GMP_LIB" -lgmp -o pi
 fi
 
